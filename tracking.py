@@ -207,10 +207,11 @@ def detect(save_img=False):
 
 
                 # Write results
-                for *xyxy, conf, cls, distance in reversed(det):
+                #for *xyxy, conf, cls, distance in reversed(det):
+                for *xyxy, obj_id, conf, cls, distance in reversed(updated_dets):
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf, distance) if opt.save_conf else (cls, *xywh, distance)  # label format
+                        line = (cls, obj_id, *xywh, conf, distance) if opt.save_conf else (cls, obj_id, *xywh, distance)  # label format
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 

@@ -17,7 +17,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import yaml
-from tueplots.constants.color import rgb
+#from tueplots.constants.color import rgb
 from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import butter, filtfilt
 from scipy.stats import gaussian_kde
