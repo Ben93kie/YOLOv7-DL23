@@ -1,5 +1,11 @@
 # Please check the [distance_network branch](https://github.com/Ben93kie/YOLOv7-DL23/tree/distance_network)!
 
+To export a "normal" Yolo model without distance network, do this:
+
+python export_yoloV7.py -w WEIGHT_FILE_PATH -s 1280 736 --simplify
+
+inside main branch. For all else related to distance estimation, switch branch.
+
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 # Official YOLOv7
