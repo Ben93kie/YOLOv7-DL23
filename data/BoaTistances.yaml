@@ -3,3 +3,9 @@ val: C:\Users\ben93\Downloads\BoaTetection_public\BoaTetection_public\BoaTetecti
 test: C:\Users\ben93\Downloads\BoaTetection_public\BoaTetection_public\BoaTetection\CombinedDatasetsChallenge\images\val
 nc: 2
 names: ['boat', 'other']
+
+#train: C:\Users\ben93\Downloads\Boat_distances\Boat_distances\images\train
+#val: C:\Users\ben93\Downloads\Boat_distances\Boat_distances\images\train
+#test: C:\Users\ben93\Downloads\Boat_distances\Boat_distances\images\train
+#nc: 2
+#names: ['boat', 'other']
