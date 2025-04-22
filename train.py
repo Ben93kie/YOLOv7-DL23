@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
-    save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
-        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
+    save_dir, epochs, batch_size, total_batch_size, weights, rank = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
 
     # Directories
     wdir = save_dir / 'weights'
@@ -49,12 +49,6 @@ def train(hyp, opt, device, tb_writer=None):
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
-
-    # Save run settings
-    with open(save_dir / 'hyp.yaml', 'w') as f:
-        yaml.dump(hyp, f, sort_keys=False)
-    with open(save_dir / 'opt.yaml', 'w') as f:
-        yaml.dump(vars(opt), f, sort_keys=False)
 
     # Configure
     plots = not opt.evolve  # create plots
@@ -65,19 +59,34 @@ def train(hyp, opt, device, tb_writer=None):
     is_coco = opt.data.endswith('coco.yaml')
 
     # Logging- Doing this before checking the dataset. Might update data_dict
-    loggers = {'wandb': None}  # loggers dict
+    loggers = {'wandb': None, 'tb': None}  # loggers dict
     if rank in [-1, 0]:
-        opt.hyp = hyp  # add hyperparameters
-        run_id = torch.load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
-        wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
-        loggers['wandb'] = wandb_logger.wandb
-        data_dict = wandb_logger.data_dict
-        if wandb_logger.wandb:
-            weights, epochs, hyp = opt.weights, opt.epochs, opt.hyp  # WandbLogger might update weights, epochs if resuming
+        if opt.logger == 'wandb':
+            import wandb
+            wandb.init(project=opt.project, name=opt.name, config=opt)
+            opt.hyp = hyp  # add hyperparameters
+            wandb.config.update(opt)
+        elif opt.logger == 'tensorboard':
+            tb_writer = SummaryWriter(str(save_dir))
+        loggers['tb'] = tb_writer
 
-    nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
-    names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
+    # Parse hyp dict
+    if isinstance(hyp, str):
+        with open(hyp) as f:
+            hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps dict
+
+    # Check dataset
+    check_dataset(data_dict)  # check
+    nc = int(data_dict['nc'])  # number of classes
+    names = data_dict['names']  # class names
+    assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)
+
+    # Define train/test paths
+    train_path = data_dict['train']
+    test_path = data_dict['val'] # Use val set for testing during training
+
+    # Add horizon_weight to hyp if not present (needed by ComputeLoss)
+    hyp['horizon_weight'] = hyp.get('horizon_weight', 1.0)
 
     # Model
     pretrained = weights.endswith('.pt')
@@ -85,26 +94,50 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        # NOTE: load the cfg from ckpt['model'].yaml if resuming, otherwise use opt.cfg
+        # This ensures that the horizon architecture is loaded if opt.cfg points to it.
+        model_cfg = opt.cfg or ckpt['model'].yaml
+        model = Model(model_cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    with torch_distributed_zero_first(rank):
-        check_dataset(data_dict)  # check
-    train_path = data_dict['train']
-    test_path = data_dict['val']
 
-    # Freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        if any(x in k for x in freeze):
-            print('freezing %s' % k)
-            v.requires_grad = False
+    # Freeze layers for horizon-only training
+    freeze_mode = opt.freeze_mode # Get freeze mode from options (e.g., 0=None, 1=Backbone, 2=Backbone+Neck)
+    if freeze_mode == 1: # Freeze backbone only
+        print(colorstr('freezing backbone layers'))
+        for name, param in model.named_parameters():
+            # Freeze layers before detection/horizon head (indices 105, 106) and not horizon head itself
+            is_head = name.startswith('model.105') or name.startswith('model.106') or 'HorizonDetect' in name
+            if not is_head:
+                param.requires_grad = False
+                # print(f"Freezing parameter: {name}") # Optional: check which layers are frozen
+            else:
+                 # print(f"Training parameter: {name}") # Optional: check which layers are trained
+                 param.requires_grad = True
+    elif freeze_mode == 2: # Freeze all except Horizon head
+        print(colorstr('freezing all except horizon head layers'))
+        for name, param in model.named_parameters():
+            # Check if the parameter name starts with the index of the HorizonDetect module (e.g., 'model.80.')
+            if not name.startswith('model.80.'): 
+                param.requires_grad = False
+            else:
+                # print(f"  [Train Mode 2] Enabling gradient for: {name}") # Removed debug print
+                param.requires_grad = True
+    else: # Train all layers
+        print(colorstr('training all layers'))
+        for name, param in model.named_parameters():
+                param.requires_grad = True
+    
+    # Verify which layers are frozen (Optional)
+    # print("--- Final Layer Freeze Status ---")
+    # for name, param in model.named_parameters():
+    #     print(f"{name}: requires_grad={param.requires_grad}")
+    # print("---------------------------------")
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -113,82 +146,51 @@ def train(hyp, opt, device, tb_writer=None):
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-    for k, v in model.named_modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
-            pg2.append(v.bias)  # biases
-        if isinstance(v, nn.BatchNorm2d):
-            pg0.append(v.weight)  # no decay
-        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
-            pg1.append(v.weight)  # apply decay
-        if hasattr(v, 'im'):
-            if hasattr(v.im, 'implicit'):           
-                pg0.append(v.im.implicit)
+    # print(colorstr("blue", "bold", "--- Populating Optimizer Groups ---")) # REMOVE Debug print
+    # Iterating directly through parameters:
+    for k, v in model.named_parameters():
+        if v.requires_grad:
+            # print(f"  Found trainable param: {k}") # REMOVE Debug print
+            if '.bias' in k:
+                # print(f"    -> Adding to pg2 (bias)") # REMOVE Debug print
+                pg2.append(v) # biases
+            elif '.weight' in k and '.bn' not in k:
+                # print(f"    -> Adding to pg1 (weight)") # REMOVE Debug print
+                pg1.append(v) # apply decay (weights other than bn)
             else:
-                for iv in v.im:
-                    pg0.append(iv.implicit)
-        if hasattr(v, 'imc'):
-            if hasattr(v.imc, 'implicit'):           
-                pg0.append(v.imc.implicit)
-            else:
-                for iv in v.imc:
-                    pg0.append(iv.implicit)
-        if hasattr(v, 'imb'):
-            if hasattr(v.imb, 'implicit'):           
-                pg0.append(v.imb.implicit)
-            else:
-                for iv in v.imb:
-                    pg0.append(iv.implicit)
-        if hasattr(v, 'imo'):
-            if hasattr(v.imo, 'implicit'):           
-                pg0.append(v.imo.implicit)
-            else:
-                for iv in v.imo:
-                    pg0.append(iv.implicit)
-        if hasattr(v, 'ia'):
-            if hasattr(v.ia, 'implicit'):           
-                pg0.append(v.ia.implicit)
-            else:
-                for iv in v.ia:
-                    pg0.append(iv.implicit)
-        if hasattr(v, 'attn'):
-            if hasattr(v.attn, 'logit_scale'):   
-                pg0.append(v.attn.logit_scale)
-            if hasattr(v.attn, 'q_bias'):   
-                pg0.append(v.attn.q_bias)
-            if hasattr(v.attn, 'v_bias'):  
-                pg0.append(v.attn.v_bias)
-            if hasattr(v.attn, 'relative_position_bias_table'):  
-                pg0.append(v.attn.relative_position_bias_table)
-        if hasattr(v, 'rbr_dense'):
-            if hasattr(v.rbr_dense, 'weight_rbr_origin'):  
-                pg0.append(v.rbr_dense.weight_rbr_origin)
-            if hasattr(v.rbr_dense, 'weight_rbr_avg_conv'): 
-                pg0.append(v.rbr_dense.weight_rbr_avg_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_pfir_conv'):  
-                pg0.append(v.rbr_dense.weight_rbr_pfir_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_idconv1'): 
-                pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_idconv1)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_conv2'):   
-                pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_conv2)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_dw'):   
-                pg0.append(v.rbr_dense.weight_rbr_gconv_dw)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_pw'):   
-                pg0.append(v.rbr_dense.weight_rbr_gconv_pw)
-            if hasattr(v.rbr_dense, 'vector'):   
-                pg0.append(v.rbr_dense.vector)
+                # print(f"    -> Adding to pg0 (other)") # REMOVE Debug print
+                pg0.append(v) # all other params (e.g., bn weights)
+    # print(colorstr("blue", "bold", "--- Finished Populating ---")) # REMOVE Debug print
+
+    # Check if groups are empty *before* optimizer init (REMOVED as optimizer init is now robust)
+    # if not pg0 and not pg1 and not pg2:
+    #     print(colorstr('bright_red', 'Error: All parameter groups (pg0, pg1, pg2) are empty before optimizer initialization!'))
+
+    # Construct parameter groups dictionary list
+    param_groups = [
+        {'params': pg0}, # Group 0 (BN weights, other non-decayed weights)
+        {'params': pg1, 'weight_decay': hyp['weight_decay']}, # Group 1 (decayed weights)
+        {'params': pg2}  # Group 2 (biases)
+    ]
 
     if opt.adam:
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        # optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999)) # Original Adam init
+        # Adam needs params with wd explicitly separated, but typically handles this via param_groups
+        optimizer = optim.Adam(param_groups, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))
     else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        # optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True) # Original SGD init
+        optimizer = optim.SGD(param_groups, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
 
-    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    # Original add_param_group calls are now redundant as groups are passed during init
+    # optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+    # optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+
+    # Log the number of parameters in each group that require gradients
+    logger.info('Optimizer groups: %g other/bn_weights (pg0), %g conv.weight (pg1), %g .bias (pg2) - Trainable Params' %
+                (len(pg0), len(pg1), len(pg2)))
     del pg0, pg1, pg2
 
-    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
-    # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
+    # Scheduler
     if opt.linear_lr:
         lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
     else:
@@ -222,7 +224,7 @@ def train(hyp, opt, device, tb_writer=None):
             assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (weights, epochs)
         if epochs < start_epoch:
             logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (weights, ckpt['epoch'], epochs))
+                      (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  # finetune additional epochs
 
         del ckpt, state_dict
@@ -243,19 +245,20 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Trainloader
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+                                          hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                          world_size=opt.world_size, workers=opt.workers,
+                                          image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
     # Process 0
     if rank in [-1, 0]:
+        ema.updates = start_epoch * nb // accumulate  # set EMA updates
         testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                       world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+                                     hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
+                                     rank=-1, world_size=opt.world_size, workers=opt.workers,
+                                     pad=0.5, prefix=colorstr('val: '))[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -263,20 +266,21 @@ def train(hyp, opt, device, tb_writer=None):
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
             # model._initialize_biases(cf.to(device))
             if plots:
-                #plot_labels(labels, names, save_dir, loggers)
+                plot_labels(labels, names, save_dir, loggers)
                 if tb_writer:
                     tb_writer.add_histogram('classes', c, 0)
 
-            # Anchors
-            if not opt.noautoanchor:
+            # Anchors - Skip check if last layer is HorizonDetect
+            anchor_check_module = model.module.model[-1] if is_parallel(model) else model.model[-1]
+            if not opt.noautoanchor and hasattr(anchor_check_module, 'anchor_grid'):
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+            # elif not opt.noautoanchor:
+                # print(colorstr('yellow', 'Skipping anchor check: Last layer is not a detection layer with anchors.'))
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
     if cuda and rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
-                    # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
-                    find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
+        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
 
     # Model parameters
     hyp['box'] *= 3. / nl  # scale to layers
@@ -296,45 +300,42 @@ def train(hyp, opt, device, tb_writer=None):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(enabled=cuda)
-    compute_loss_ota = ComputeLossOTA(model)  # init loss class
+    scaler = torch.cuda.amp.GradScaler(enabled=cuda)
     compute_loss = ComputeLoss(model)  # init loss class
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
-    torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
         # Update image weights (optional)
         if opt.image_weights:
-            # Generate indices
-            if rank in [-1, 0]:
-                cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
-                iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
-                dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
-            # Broadcast if DDP
-            if rank != -1:
-                indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
-                dist.broadcast(indices, 0)
-                if rank != 0:
-                    dataset.indices = indices.cpu().numpy()
+            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+            iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
+            dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
 
-        # Update mosaic border
+        # Update mosaic border (optional)
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(4, device=device)  # mean losses
+        # Initialize mloss with 5 elements for box, obj, cls, horizon, total
+        mloss = torch.zeros(5, device=device)  
+        # mloss = torch.zeros(4, device=device)  # Original: mean losses (box, obj, cls, total)
+        
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
+        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'horizon', 'total', 'targets'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, batch in pbar: # Correctly iterate using 'batch'
             ni = i + nb * epoch  # number integrated batches (since train start)
+
+            # Unpack batch data (moved inside loop)
+            imgs, targets_det, targets_hor, paths, shapes = batch
+
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
@@ -358,16 +359,20 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward
             with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
-                if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
-                else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if rank != -1:
-                    loss *= opt.world_size  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
+                # Unpack data from dataloader (now returns 3 target tensors)
+                # imgs, targets, paths, shapes = batch # REMOVE redundant unpacking here
 
+                # Move data to device
+                # imgs = imgs.to(device, non_blocking=True).float() / 255.0 # Already done above
+                targets_det = targets_det.to(device)
+                targets_hor = targets_hor.to(device) # Move horizon targets too
+
+                pred = model(imgs)  # forward
+                # loss, loss_items = compute_loss(pred, targets)  # loss scaled by batch_size
+                loss, loss_items = compute_loss(pred, targets_det, targets_hor)  # Pass both targets
+                if rank != -1:
+                    loss *= opt.world_size  # gradient averaged between devices in DDP
+                
             # Backward
             scaler.scale(loss).backward()
 
@@ -384,25 +389,23 @@ def train(hyp, opt, device, tb_writer=None):
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets_det.shape[0])
                 pbar.set_description(s)
 
                 # Plot
-                if plots and ni < 10:
+                if plots and ni < 3:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
-                    Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                    Thread(target=plot_images, args=(imgs, targets_det, paths, f), daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
-                elif plots and ni == 10 and wandb_logger.wandb:
-                    wandb_logger.log({"Mosaics": [wandb_logger.wandb.Image(str(x), caption=x.name) for x in
-                                                  save_dir.glob('train*.jpg') if x.exists()]})
+                elif plots and ni == 10 and loggers.get('wandb') is not None:
+                    loggers['wandb'].log({"Mosaics": [loggers['wandb'].Image(str(x), caption=x.name) for x in save_dir.glob('train*.jpg')]})
 
             # end batch ------------------------------------------------------------------------------------------------
-        # end epoch ----------------------------------------------------------------------------------------------------
 
         # Scheduler
-        lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
+        lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
         # DDP process 0 or single-GPU
@@ -411,20 +414,17 @@ def train(hyp, opt, device, tb_writer=None):
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
-                wandb_logger.current_epoch = epoch + 1
-                results, maps, times = test.test(data_dict,
-                                                 batch_size=batch_size * 2,
-                                                 imgsz=imgsz_test,
-                                                 model=ema.ema,
-                                                 single_cls=opt.single_cls,
-                                                 dataloader=testloader,
-                                                 save_dir=save_dir,
-                                                 verbose=nc < 50 and final_epoch,
-                                                 plots=plots and final_epoch,
-                                                 wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
-                                                 is_coco=is_coco,
-                                                 v5_metric=opt.v5_metric)
+                results, maps, times = test.test(opt.data,
+                                             batch_size=batch_size * 2,
+                                             imgsz=imgsz_test,
+                                             model=ema.ema,
+                                             single_cls=opt.single_cls,
+                                             dataloader=testloader,
+                                             save_dir=save_dir,
+                                             save_json=is_coco and final_epoch,
+                                             verbose=nc < 50 and final_epoch,
+                                             plots=plots and final_epoch,
+                                             compute_loss=compute_loss)
 
             # Write
             with open(results_file, 'a') as f:
@@ -433,21 +433,20 @@ def train(hyp, opt, device, tb_writer=None):
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
             # Log
-            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss', 'train/horizon_loss',  # train loss
                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                    'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+                    'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/horizon_loss',  # val loss
                     'x/lr0', 'x/lr1', 'x/lr2']  # params
             for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
-                if wandb_logger.wandb:
-                    wandb_logger.log({tag: x})  # W&B
+                if loggers.get('wandb'):
+                    loggers['wandb'].log({tag: x})  # W&B
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            wandb_logger.end_epoch(best_result=best_fitness == fi)
 
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
@@ -458,66 +457,55 @@ def train(hyp, opt, device, tb_writer=None):
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
-                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+                        'wandb_id': loggers.get('wandb') and loggers['wandb'].run.id if loggers.get('wandb') else None}
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
-                if (best_fitness == fi) and (epoch >= 200):
-                    torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
-                if epoch == 0:
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                elif ((epoch+1) % 25) == 0:
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                elif epoch >= (epochs-5):
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                if wandb_logger.wandb:
+                if loggers.get('wandb'):
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
-                        wandb_logger.log_model(
-                            last.parent, opt, epoch, fi, best_model=best_fitness == fi)
+                        loggers['wandb'].save(str(wdir / 'last.pt'), policy='now')
                 del ckpt
 
         # end epoch ----------------------------------------------------------------------------------------------------
-    # end training
+    # end training ----------------------------------------------------------------------------------------------------
+
     if rank in [-1, 0]:
         # Plots
         if plots:
             plot_results(save_dir=save_dir)  # save as results.png
-            if wandb_logger.wandb:
-                files = ['results.png', 'confusion_matrix.png', *[f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R')]]
-                wandb_logger.log({"Results": [wandb_logger.wandb.Image(str(save_dir / f), caption=f) for f in files
-                                              if (save_dir / f).exists()]})
+            if loggers.get('wandb'):
+                loggers['wandb'].log({"Results": [loggers['wandb'].Image(str(save_dir / x), caption=x) for x in
+                                    ['results.png', 'train_batch0.jpg', 'test_batch0.jpg'] if
+                                    (save_dir / x).exists()]})
         # Test best.pt
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
-        if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
-            for m in (last, best) if best.exists() else (last):  # speed, mAP tests
+        if opt.data.endswith('coco.yaml'):
+            for m in [last, best] if best.exists() else [last]:  # speed, mAP tests
                 results, _, _ = test.test(opt.data,
-                                          batch_size=batch_size * 2,
-                                          imgsz=imgsz_test,
-                                          conf_thres=0.001,
-                                          iou_thres=0.7,
-                                          model=attempt_load(m, device).half(),
-                                          single_cls=opt.single_cls,
-                                          dataloader=testloader,
-                                          save_dir=save_dir,
-                                          save_json=True,
-                                          plots=False,
-                                          is_coco=is_coco,
-                                          v5_metric=opt.v5_metric)
+                                       batch_size=batch_size * 2,
+                                       imgsz=imgsz_test,
+                                       model=attempt_load(m, device).half(),
+                                       single_cls=opt.single_cls,
+                                       dataloader=testloader,
+                                       save_dir=save_dir,
+                                       save_json=True,
+                                       plots=True)
 
-        # Strip optimizers
+        # Strip optimizer
         final = best if best.exists() else last  # final model
-        for f in last, best:
-            if f.exists():
-                strip_optimizer(f)  # strip optimizers
+        for f in ['', 'f']:  # strip and strip_f
+            strip_optimizer(final)  # strip optimizers
         if opt.bucket:
             os.system(f'gsutil cp {final} gs://{opt.bucket}/weights')  # upload
-        if wandb_logger.wandb and not opt.evolve:  # Log the stripped model
-            wandb_logger.wandb.log_artifact(str(final), type='model',
-                                            name='run_' + wandb_logger.wandb_run.id + '_model',
-                                            aliases=['last', 'best', 'stripped'])
-        wandb_logger.finish_run()
+        if loggers.get('wandb') and final_epoch:  # Log the stripped model
+            loggers['wandb'].log({"artifact": loggers['wandb'].Artifact('model', type='model',
+                                                metadata={'epochs': epochs,
+                                                        'training_results': results_file.read_text()},
+                                                aliases=['last', 'best', 'stripped'])})
+        if loggers.get('wandb'):
+            loggers['wandb'].run.finish()
     else:
         dist.destroy_process_group()
     torch.cuda.empty_cache()
@@ -562,6 +550,8 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--freeze_mode', type=int, default=0, help='Freeze layers: 0=None, 1=Backbone, 2=Backbone+Neck')
+    parser.add_argument('--logger', type=str, default='tensorboard', help='Logging utility: wandb or tensorboard')
     opt = parser.parse_args()
 
     # Set DDP variables

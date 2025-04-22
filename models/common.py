@@ -483,7 +483,12 @@ class RepConv(nn.Module):
             self.rbr_reparam = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=True)
 
         else:
+            # Initialize BatchNorm with c1 (input channels) for the identity branch
             self.rbr_identity = (nn.BatchNorm2d(num_features=c1) if c2 == c1 and s == 1 else None)
+
+            # --- Add Debugging ---
+            # print(f"DEBUG RepConv __init__: c1={c1}, c2={c2}, s={s}, condition={(c2 == c1 and s == 1)}, result_type={type(self.rbr_identity)}")
+            # --- End Debugging ---
 
             self.rbr_dense = nn.Sequential(
                 nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False),
@@ -499,9 +504,18 @@ class RepConv(nn.Module):
         if hasattr(self, "rbr_reparam"):
             return self.act(self.rbr_reparam(inputs))
 
+        # --- Add Debugging ---
+        # print(f"DEBUG RepConv: Input shape: {inputs.shape}") 
+        # print(f"DEBUG RepConv: self.rbr_identity type: {type(self.rbr_identity)}")
+        # if isinstance(self.rbr_identity, nn.BatchNorm2d):
+        #      print(f"DEBUG RepConv: self.rbr_identity.num_features: {self.rbr_identity.num_features}")
+        # --- End Debugging ---
+
         if self.rbr_identity is None:
             id_out = 0
+            # print(f"DEBUG RepConv: Taking 'is None' path for identity.") # Debug
         else:
+            # print(f"DEBUG RepConv: Taking 'else' path for identity.") # Debug
             id_out = self.rbr_identity(inputs)
 
         return self.act(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
@@ -1587,15 +1601,15 @@ class SwinTransformerBlock(nn.Module):
         self.conv = None
         if c1 != c2:
             self.conv = Conv(c1, c2)
-
-        # remove input_resolution
-        self.blocks = nn.Sequential(*[SwinTransformerLayer(dim=c2, num_heads=num_heads, window_size=window_size,
+        self.linear = nn.Linear(c2, c2)  # learnable position embedding
+        self.tr = nn.Sequential(*[SwinTransformerLayer(c2, num_heads, window_size=window_size,
                                  shift_size=0 if (i % 2 == 0) else window_size // 2) for i in range(num_layers)])
+        self.c2 = c2
 
     def forward(self, x):
         if self.conv is not None:
             x = self.conv(x)
-        x = self.blocks(x)
+        x = self.tr(x)
         return x
 
 

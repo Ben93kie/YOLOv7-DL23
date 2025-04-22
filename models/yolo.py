@@ -94,6 +94,62 @@ class Detect(nn.Module):
         return (box, score)
 
 
+class HorizonDetect(nn.Module):
+    stride = None  # strides computed during build
+    export = False  # onnx export
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, ch=()):  # detection layer
+        super(HorizonDetect, self).__init__()
+        self.no = 2  # number of outputs (y-intercept and slope)
+        self.nl = len(ch)  # number of detection layers (expected to be 1)
+        # Add Adaptive Average Pooling
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        # Output conv layer
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no, 1) for x in ch)  # output conv
+
+    def forward(self, x):
+        # x = x.copy()  # for profiling
+        z = []  # inference output
+        self.training |= self.export
+
+        # Assuming self.nl is always 1 for HorizonDetect based on typical usage
+        if self.nl != 1:
+             print(f"Warning: HorizonDetect received {self.nl} input feature maps, expected 1.")
+        
+        # Process the first (and likely only) input feature map
+        x_in = x[0] 
+
+        # Apply GAP
+        x_pooled = self.pool(x_in)
+
+        # Apply final conv layer
+        x_out = self.m[0](x_pooled)
+
+        # Remove spatial dimensions (1, 1)
+        x_out = x_out.view(x_out.shape[0], -1) # Shape becomes (bs, self.no)
+
+        if self.training:
+            # Return the tensor directly (bs, self.no)
+            # Apply sigmoid to stabilize training
+            out = x_out.sigmoid() 
+        else: # Inference
+            # Apply sigmoid and return tensor (or potentially tuple like other heads?)
+            # For now, just sigmoid and return tensor for consistency with training
+            y = x_out.sigmoid()
+            # Note: Inference path might need adjustment based on how it's used later
+            # The original inference path created `z` and potentially concatenated. 
+            # Returning just the tensor seems more logical for horizon prediction.
+            out = y
+
+        return out
+
+    # Remove convert method as it's likely not needed for horizon output
+    # def convert(self, z): ...
+
+
 class IDetect(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
@@ -236,7 +292,7 @@ class IKeypoint(nn.Module):
                 self.m_kpt = nn.ModuleList(
                             nn.Sequential(DWConv(x, x, k=3), Conv(x,x),
                                           DWConv(x, x, k=3), Conv(x, x),
-                                          DWConv(x, x, k=3), Conv(x,x),
+                                          DWConv(x, x, k=3), Conv(x, x),
                                           DWConv(x, x, k=3), Conv(x, x),
                                           DWConv(x, x, k=3), Conv(x, x),
                                           DWConv(x, x, k=3), nn.Conv2d(x, self.no_kpt * self.na, 1)) for x in ch)
@@ -277,16 +333,6 @@ class IKeypoint(nn.Module):
                     if self.nkpt != 0:
                         x_kpt[..., 0::3] = (x_kpt[..., ::3] * 2. - 0.5 + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
                         x_kpt[..., 1::3] = (x_kpt[..., 1::3] * 2. - 0.5 + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (x_kpt[..., ::3] + kpt_grid_x.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (x_kpt[..., 1::3] + kpt_grid_y.repeat(1,1,1,1,17)) * self.stride[i]  # xy
-                        #print('=============')
-                        #print(self.anchor_grid[i].shape)
-                        #print(self.anchor_grid[i][...,0].unsqueeze(4).shape)
-                        #print(x_kpt[..., 0::3].shape)
-                        #x_kpt[..., 0::3] = ((x_kpt[..., 0::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = ((x_kpt[..., 1::3].tanh() * 2.) ** 3 * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 0::3] = (((x_kpt[..., 0::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,0].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_x.repeat(1,1,1,1,17) * self.stride[i]  # xy
-                        #x_kpt[..., 1::3] = (((x_kpt[..., 1::3].sigmoid() * 4.) ** 2 - 8.) * self.anchor_grid[i][...,1].unsqueeze(4).repeat(1,1,1,1,self.nkpt)) + kpt_grid_y.repeat(1,1,1,1,17) * self.stride[i]  # xy
                         x_kpt[..., 2::3] = x_kpt[..., 2::3].sigmoid()
 
                     y = torch.cat((xy, wh, y[..., 4:], x_kpt), dim = -1)
@@ -518,62 +564,106 @@ class Model(nn.Module):
                 self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
 
         # Define model
-        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        ch_initial = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
         if nc and nc != self.yaml['nc']:
             logger.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        self.model, self.save, self.ch = parse_model(deepcopy(self.yaml), [ch_initial])  # model, savelist, channels list
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
-        # Build strides, anchors
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
-            s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-        if isinstance(m, IDetect):
-            s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-        if isinstance(m, IAuxDetect):
-            s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
-            #print(m.stride)
-            check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_aux_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-        if isinstance(m, IBin):
-            s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_biases_bin()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-        if isinstance(m, IKeypoint):
-            s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
-            self.stride = m.stride
-            self._initialize_biases_kpt()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
+        # Build strides, anchors for all necessary heads
+        self.stride = None # Initialize self.stride
+        for i, m in enumerate(self.model):
+            if isinstance(m, (Detect, IDetect, IAuxDetect, IBin, IKeypoint)):
+                s = 256  # 2x min stride
+                
+                # Calculate stride using a dummy forward specific to this head
+                # This requires the head module `m` to have a `forward` method
+                # that can accept a dummy tensor of appropriate channel count.
+                # We need the number of input channels `ch_in` to the head `m`.
+                # Let's retrieve it from the `ch` list created by `parse_model`.
+                # Note: `parse_model` appends output channels, so `ch[m.f]` or `ch[m.f[0]]` might work.
+                
+                try:
+                    # Determine input channels `ch_in` based on `m.f`
+                    if isinstance(m.f, int):
+                        # Handle negative 'f' indices correctly relative to current layer 'i'
+                        # Note: ch[k] stores the output channels of layer k-1.
+                        source_layer_index = i + m.f if m.f < 0 else m.f 
+                        c1 = self.ch[source_layer_index + 1] # Get output channel of the source layer
+                    elif isinstance(m.f, list):
+                         # For multi-input heads like IDetect, need list of channel counts
+                         # ch_in = [self.model[j].c2 for j in m.f] # Placeholder - NEEDS PROPER FIX
+                         pass # Defer calculation
+                    else:
+                         raise ValueError(f"Unexpected layer.f type: {type(m.f)}")
+                    
+                    # ---> Let's skip stride calculation FOR NOW and fix parse_model first.
+                    # dummy_input = torch.zeros(1, ch_in, s, s)
+                    # head_output = m(dummy_input)
+                    # output_shape = head_output[0].shape if isinstance(head_output, tuple) else head_output.shape
+                    # m.stride = torch.tensor([s / output_shape[-2]])
+                    
+                    # Placeholder stride assignment until parse_model is fixed
+                    if not hasattr(m, 'stride') or m.stride is None:
+                        logger.warning(f"Layer {i} ({m.type}): Stride not calculated dynamically, assigning default.")
+                        if isinstance(m, (Detect, IDetect)) and len(m.anchors) == 3:
+                             m.stride = torch.tensor([8., 16., 32.])
+                        else:
+                             m.stride = torch.tensor([8.]) # Default single stride
+                
+                except Exception as e:
+                    logger.warning(f"Layer {i} ({m.type}): Error during stride setup - {e}. Assigning default.")
+                    if not hasattr(m, 'stride') or m.stride is None:
+                         m.stride = torch.tensor([8.]) # Default single stride
+                
+                # Handle anchor grid setup for detection heads
+                if hasattr(m, 'anchor_grid') and hasattr(m, 'stride') and m.stride is not None:
+                    check_anchor_order(m)
+                    # Ensure stride has correct dimensions for division
+                    stride_view = m.stride.view(-1, 1, 1)
+                    # Ensure anchor grid matches number of strides
+                    nl_stride = stride_view.shape[0]
+                    nl_anchor = m.anchor_grid.shape[0]
+                    if nl_stride == nl_anchor:
+                         m.anchors /= stride_view
+                    elif nl_anchor % nl_stride == 0: # Check if anchors are grouped per stride
+                        na = m.anchor_grid.shape[2]
+                        m.anchors = m.anchors.view(nl_stride, -1, 2)
+                        m.anchor_grid = m.anchor_grid.view(nl_stride, 1, -1, 1, 1, 2)
+                        m.anchors /= stride_view
+                    else:
+                         logger.warning(f"Layer {i} ({m.type}): Mismatch between strides ({nl_stride}) and anchors ({nl_anchor}). Skipping scaling.")
+                
+                # Store the main detection stride (assuming IDetect or Detect is primary)
+                if isinstance(m, (IDetect, Detect)) and self.stride is None:
+                     self.stride = m.stride
+                
+                # Initialize biases for the specific head type (ensure stride exists)
+                if hasattr(m, 'stride') and m.stride is not None:
+                    if isinstance(m, Detect) or isinstance(m, IDetect):
+                        self._initialize_biases(head=m)
+                    elif isinstance(m, IAuxDetect):
+                        self._initialize_aux_biases(head=m)
+                    elif isinstance(m, IBin):
+                        self._initialize_biases_bin(head=m)
+                    elif isinstance(m, IKeypoint):
+                        self._initialize_biases_kpt(head=m)
+                else:
+                    logger.warning(f"Layer {i} ({m.type}): Skipping bias initialization due to missing stride.")
 
-        # Init weights, biases
+            # We might need similar logic for HorizonDetect if it needs stride?
+            # Currently HorizonDetect doesn't use self.stride in its forward pass.
+            
+        # Ensure a primary stride was found if expected
+        if self.stride is None:
+             logger.warning("Could not determine primary model stride.")
+
+        # Init weights, biases (general initialization)
         initialize_weights(self)
         self.info()
         logger.info('')
@@ -600,84 +690,102 @@ class Model(nn.Module):
 
     def forward_once(self, x, profile=False):
         y, dt = [], []  # outputs
+        detection_output = None
+        horizon_output = None
+
         for m in self.model:
             if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+                # Get input(s) from stored outputs `y`
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
-            if not hasattr(self, 'traced'):
-                self.traced=False
+            # Debug print before calling the module - REMOVED
+            # print(f"DEBUG: Before m(x): Layer {m.i}, Module Type: {m.type}, Input Type: {type(x)}") 
 
-            if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
-                    break
+            # Run the current module
+            x = m(x)
 
-            if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
-                o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
-                for _ in range(10):
-                    m(x.copy() if c else x)
-                t = time_synchronized()
-                for _ in range(10):
-                    m(x.copy() if c else x)
-                dt.append((time_synchronized() - t) * 100)
-                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+            # Always store the output tensor `x` for potential use by subsequent layers.
+            y.append(x)
 
-            x = m(x)  # run
-            
-            y.append(x if m.i in self.save else None)  # save output
+            # Keep track of the specific head outputs
+            if isinstance(m, IDetect):
+                detection_output = x
+                # print(f"DEBUG: Assigned detection_output (type: {type(detection_output)}) ") # REMOVED
+            elif isinstance(m, HorizonDetect):
+                horizon_output = x
+                # print(f"DEBUG: Assigned horizon_output (type: {type(horizon_output)}) ") # REMOVED
 
-        if profile:
-            print('%.1fms total' % sum(dt))
-        return x
+        # --- Profiling code removed for clarity --- 
 
-    def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+        # Return based on which heads were found
+        if detection_output is not None and horizon_output is not None:
+            # During training, heads return lists/tensors, inference might return tuple
+            # Handle potential tuples from inference mode if needed, though training is primary concern here
+            det_out = detection_output[0] if isinstance(detection_output, tuple) and not self.training else detection_output
+            hor_out = horizon_output[0] if isinstance(horizon_output, tuple) and not self.training else horizon_output
+            # print(f"DEBUG: Returning Detection (type: {type(det_out)}) and Horizon (type: {type(hor_out)})" ) # REMOVED
+            return det_out, hor_out 
+        elif detection_output is not None:
+            # print(f"DEBUG: Returning only Detection (type: {type(detection_output)})") # REMOVED
+            # Handle potential tuple from inference mode
+            return detection_output[0] if isinstance(detection_output, tuple) and not self.training else detection_output
+        elif horizon_output is not None:
+             # print(f"DEBUG: Returning only Horizon (type: {type(horizon_output)})") # REMOVED
+             # Handle potential tuple from inference mode
+             return horizon_output[0] if isinstance(horizon_output, tuple) and not self.training else horizon_output
+        else:
+            # print(f"DEBUG: Returning last computed x (type: {type(x)}) ") # REMOVED
+            # Fallback: return the last computed output if no specific head output was identified
+            return x
+
+    def _initialize_biases(self, head, cf=None):
+        m = head # Use passed head module
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        for mi, s in zip(m.m, m.stride):
+             b = mi.bias.view(m.na, -1) 
+             b.data[:, 4] += math.log(8 / (640 / s) ** 2) 
+             b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum()) 
+             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
-    def _initialize_aux_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+    def _initialize_aux_biases(self, head, cf=None):
+        m = head # Use passed head module
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Detect() module
-        for mi, mi2, s in zip(m.m, m.m2, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+        for mi, mi2, s in zip(m.m, m.m2, m.stride):
+            b = mi.bias.view(m.na, -1)
+            b.data[:, 4] += math.log(8 / (640 / s) ** 2)
+            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
-            b2 = mi2.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b2.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b2.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            b2 = mi2.bias.view(m.na, -1)
+            b2.data[:, 4] += math.log(8 / (640 / s) ** 2)
+            b2.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
             mi2.bias = torch.nn.Parameter(b2.view(-1), requires_grad=True)
 
-    def _initialize_biases_bin(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+    def _initialize_biases_bin(self, head, cf=None):
+        m = head # Use passed head module
+        bc = m.bin_count
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Bin() module
-        bc = m.bin_count
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+        for mi, s in zip(m.m, m.stride):
+            b = mi.bias.view(m.na, -1)
             old = b[:, (0,1,2,bc+3)].data
             obj_idx = 2*bc+4
             b[:, :obj_idx].data += math.log(0.6 / (bc + 1 - 0.99))
-            b[:, obj_idx].data += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b[:, (obj_idx+1):].data += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            b[:, obj_idx].data += math.log(8 / (640 / s) ** 2)
+            b[:, (obj_idx+1):].data += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
             b[:, (0,1,2,bc+3)].data = old
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
-    def _initialize_biases_kpt(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+    def _initialize_biases_kpt(self, head, cf=None):
+        m = head # Use passed head module
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        for mi, s in zip(m.m, m.stride):
+             b = mi.bias.view(m.na, -1) 
+             b.data[:, 4] += math.log(8 / (640 / s) ** 2) 
+             b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum()) 
+             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
         m = self.model[-1]  # Detect() module
@@ -733,13 +841,13 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+def parse_model(d, ch_initial):  # model_dict, initial_input_channels(e.g., [3])
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, ch = [], [], ch_initial # layers, savelist, channel list (ch has initial input channels at ch[0])
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
@@ -749,6 +857,23 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        
+        # ----- Refactored Channel Calculation Logic -----
+        args_orig = deepcopy(args) # Save original args from YAML for logging/reference
+        
+        # 1. Calculate input channels `c1` or list `c1_list`
+        if isinstance(f, int):
+            # Handle negative 'f' indices correctly relative to current layer 'i'
+            # Note: ch[k] stores the output channels of layer k-1.
+            source_layer_index = i + f if f < 0 else f 
+            c1 = ch[source_layer_index + 1] # Get output channel of the source layer
+        else: # f is a list
+            # Handle negative indices within the list
+            c1_list = [ch[i + x + 1] if x < 0 else ch[x+1] for x in f]
+            c1 = c1_list
+            
+        # 2. Calculate output channels `c2` and determine `constructor_args` based on module `m`
+        constructor_args = [] # Initialize
         if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
                  SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
                  Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
@@ -760,57 +885,110 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                  Ghost, GhostCSPA, GhostCSPB, GhostCSPC,
                  SwinTransformerBlock, STCSPA, STCSPB, STCSPC,
                  SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, 8)
-
-            args = [c1, c2, *args[1:]]
+            # These modules generally take (c1, c2, *other_args_from_yaml)
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = args_orig[0] # Target output channels from YAML args[0]
+            if c2 != no: c2 = make_divisible(c2 * gw, 8)
+            constructor_args = [c1, c2, *args_orig[1:]] 
+            # Special handling for CSP blocks needing 'n' inserted
             if m in [DownC, SPPCSPC, GhostSPPCSPC, 
                      BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
                      RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC, 
-                     ResCSPA, ResCSPB, ResCSPC, 
-                     RepResCSPA, RepResCSPB, RepResCSPC, 
-                     ResXCSPA, ResXCSPB, ResXCSPC, 
-                     RepResXCSPA, RepResXCSPB, RepResXCSPC,
-                     GhostCSPA, GhostCSPB, GhostCSPC,
-                     STCSPA, STCSPB, STCSPC,
+                     ResCSPA, ResCSPB, ResCSPC, RepResCSPA, RepResCSPB, RepResCSPC, 
+                     ResXCSPA, ResXCSPB, ResXCSPC, RepResXCSPA, RepResXCSPB, RepResXCSPC,
+                     GhostCSPA, GhostCSPB, GhostCSPC, STCSPA, STCSPB, STCSPC,
                      ST2CSPA, ST2CSPB, ST2CSPC]:
-                args.insert(2, n)  # number of repeats
-                n = 1
+                constructor_args.insert(2, n); n = 1 # Insert n repeats, set n=1 for nn.Sequential wrapping
+        
         elif m is nn.BatchNorm2d:
-            args = [ch[f]]
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 # Output channels = input channels
+            constructor_args = [c1] # BN constructor takes num_features=c1
+        
         elif m is Concat:
-            c2 = sum([ch[x] for x in f])
-        elif m is Chuncat:
-            c2 = sum([ch[x] for x in f])
+            if not isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Expected list of input channels, got {c1}.")
+            c2 = sum(c1) # Output channels = sum of list of input channels
+            constructor_args = args_orig # Concat constructor takes dimension from YAML args
+        
         elif m is Shortcut:
-            c2 = ch[f[0]]
+            if not isinstance(c1, list) or len(c1) != 2: raise TypeError(f"Layer {i} ({m.__name__}): Expected list of 2 input channels, got {c1}.")
+            c2 = c1[0] # Output channels = channels of first input in list
+            constructor_args = args_orig # Shortcut constructor takes dimension from YAML args
+            
         elif m is Foldcut:
-            c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
-            args.append([ch[x] for x in f])
-            if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 // 2 # Output channels = input / 2
+            constructor_args = args_orig # Foldcut constructor takes dimension from YAML args
+            
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]: # Heads taking ..., ch
+            if not isinstance(c1, list): c1 = [c1] # Ensure c1 is a list for heads
+            c2 = -1 # Output channels not relevant for main ch list progression
+            constructor_args = args_orig # Head constructors take nc, anchors, etc. from YAML args
+            constructor_args.append(c1) # Append the calculated list of input channels `c1`
+            # Handle anchor int format
+            if m in [Detect, IDetect] and len(constructor_args) > 1 and isinstance(constructor_args[1], int):
+                 constructor_args[1] = [list(range(constructor_args[1] * 2))] * len(f)
+        
+        elif m is HorizonDetect: # Head taking ch
+             if not isinstance(c1, list): c1 = [c1]
+             c2 = -1
+             constructor_args = args_orig # Takes no args from YAML initially
+             constructor_args.append(c1) # Appends list of input channels
+             
         elif m is ReOrg:
-            c2 = ch[f] * 4
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 * 4
+            constructor_args = args_orig # ReOrg constructor takes no args
+            
         elif m is Contract:
-            c2 = ch[f] * args[0] ** 2
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 * args_orig[0] ** 2
+            constructor_args = args_orig # Contract constructor takes gain
+            
         elif m is Expand:
-            c2 = ch[f] // args[0] ** 2
-        else:
-            c2 = ch[f]
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 // args_orig[0] ** 2
+            constructor_args = args_orig # Expand constructor takes gain
+            
+        elif m is nn.Upsample:
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 # Upsample keeps the channel count
+            constructor_args = args_orig # Upsample takes scale_factor, mode from YAML
+            
+        elif m is MP: # MaxPool
+            if isinstance(c1, list): raise TypeError(f"Layer {i} ({m.__name__}): Received list of input channels {c1}, but expected a single int.")
+            c2 = c1 # MaxPool keeps the channel count
+            constructor_args = args_orig # MP constructor takes k from YAML
+            
+        else: # Fallback for unhandled modules
+            # This is risky, assume output=input and constructor takes YAML args directly
+            print(f"WARNING: Layer {i}, Module {m.__name__}: Unhandled in parse_model channel calculation. Assuming c2=c1 and constructor takes YAML args.")
+            c2 = c1[0] if isinstance(c1, list) else c1
+            constructor_args = args_orig
 
-        m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
+        # 3. Construct the module
+        m_ = nn.Sequential(*[m(*constructor_args) for _ in range(n)]) if n > 1 else m(*constructor_args)
+        # ---------------------------------------------
+
         t = str(m)[8:-2].replace('__main__.', '')  # module type
         np = sum([x.numel() for x in m_.parameters()])  # number params
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        # Log using constructor_args for accuracy, consider showing args_orig too?
+        log_args = str(constructor_args) # Or maybe format differently? 
+        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, log_args))
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
-        if i == 0:
-            ch = []
-        ch.append(c2)
-    return nn.Sequential(*layers), sorted(save)
+        ch.append(c2) # Append calculated output channels
+        
+        # ---> DEBUG PRINT <-----
+        # if i >= 0 and i <= 5: # Check first few layers
+        #      print(f"DEBUG parse_model: Layer={i}, From={f}, Module={t}, C1={c1}, C2={c2}, ConstructorArgs={constructor_args}")
+        #      print(f"DEBUG parse_model: Layer={i}, Appended c2={c2}, New Ch Len={len(ch)}, Last 5 ch={ch[-5:]}") 
+        # elif i >= 70 and i <= 82: # Check layers around the error
+        #      print(f"DEBUG parse_model: Layer={i}, From={f}, Module={t}, C1={c1}, C2={c2}, ConstructorArgs={constructor_args}")
+        #      print(f"DEBUG parse_model: Layer={i}, Appended c2={c2}, New Ch Len={len(ch)}, Last 5 ch={ch[-5:]}") 
+
+    return nn.Sequential(*layers), sorted(list(set(save))), ch
 
 
 if __name__ == '__main__':

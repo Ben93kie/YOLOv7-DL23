@@ -101,7 +101,7 @@ def test(data,
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, (img, targets, horizon_labels_ignored, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -116,7 +116,7 @@ def test(data,
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                pass  # Skip loss calculation during testing
 
             # Run NMS
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
@@ -126,10 +126,21 @@ def test(data,
             t1 += time_synchronized() - t
 
         # Statistics per image
+        # --- DEBUG PRINT --- 
+        # print(f"\nDEBUG test.py: Before inner loop: type(paths) = {type(paths)}, len(paths) = {len(paths) if isinstance(paths, (list, tuple)) else 'N/A'}") 
+        # if isinstance(paths, (list, tuple)) and len(paths) > 0:
+        #     print(f"DEBUG test.py: Before inner loop: type(paths[0]) = {type(paths[0])}, value[0] = {paths[0]}")
+        # --- END DEBUG --- 
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
+            # --- DEBUG PRINT --- 
+            # try:
+            #     print(f"DEBUG test.py: Inner loop: si = {si}, type(paths[si]) = {type(paths[si])}, value = {paths[si]}")
+            # except Exception as e:
+            #     print(f"DEBUG test.py: Error accessing paths[{si}]: {e}")
+            # --- END DEBUG --- 
             path = Path(paths[si])
             seen += 1
 

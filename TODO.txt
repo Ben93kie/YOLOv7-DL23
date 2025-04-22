@@ -1,0 +1,7 @@
+- [High Priority] Acquire and integrate REAL horizon label data for training and validation. Current training relies on dummy labels.
+- Refine horizon label loading in `utils/datasets.py`: Ensure robustness for mixed datasets (some images with horizon, some without) and consider edge cases.
+- Revert the default `horizon_target` in `utils/datasets.py` from `[0.5, 0.1]` to `[0., 0.]` or make it configurable/dynamic based on data presence.
+- Update standard `test.py` to correctly handle the dual model output (detection + horizon) from `model(img)` if used for validation during horizon training.
+- Implement validation metrics for horizon prediction in standard `test.py` (e.g., calculate MSE/MAE on the validation set using loaded horizon labels, if available).
+- Investigate potential numerical instability (`inf` loss) during horizon head training if it reappears in longer runs (consider gradient clipping, lower LR for the horizon head specifically, different loss functions like L1).
+- Adapt `test_horizon_trained.py` or create a new visualization script to draw the predicted vs ground truth horizon lines on images for qualitative evaluation. 

@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
 from utils.torch_utils import is_parallel
+# from models.yolo import IDetect # REMOVE top-level import
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -438,24 +439,49 @@ class ComputeLoss:
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
-        det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+        # Find the actual detection head (e.g., IDetect) instead of assuming it's the last layer
+        # Import IDetect locally to avoid circular dependency
+        from models.yolo import IDetect, Detect 
+        det = None
+        model_modules = model.module.model if is_parallel(model) else model.model
+        for module in model_modules:
+            # Check for IDetect first, then fall back to Detect if needed
+            if isinstance(module, IDetect) or isinstance(module, Detect):
+                det = module
+                break
+        
+        if det is None:
+             raise RuntimeError("Could not find Detection Head (IDetect/Detect) in the model modules.")
+
+        # det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Original line: Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
-        #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.1, .05])  # P3-P7
-        #self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.5, 0.4, .1])  # P3-P7
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
-        for k in 'na', 'nc', 'nl', 'anchors':
-            setattr(self, k, getattr(det, k))
+        self.na = det.na  # number of anchors
+        self.nc = det.nc  # number of classes
+        self.nl = det.nl  # number of layers
+        self.anchors = det.anchors
+        self.device = device
 
-    def __call__(self, p, targets):  # predictions, targets, model
-        device = targets.device
-        lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        # Horizon loss additions
+        self.horizon_loss_fn = nn.MSELoss(reduction='mean')
+        self.horizon_weight = h.get('horizon_weight', 1.0) # Default weight if not in hyp
+
+    def __call__(self, p, targets_det, targets_hor):  # predictions = (det_pred, hor_pred), targets_det, targets_hor
+        det_pred, hor_pred = p # Unpack predictions
+        # Initialize losses as 0D scalars
+        lcls = torch.zeros((), device=self.device)
+        lbox = torch.zeros((), device=self.device)
+        lobj = torch.zeros((), device=self.device)
+        # lcls, lbox, lobj = torch.zeros(1, device=self.device), torch.zeros(1, device=self.device), torch.zeros(1, device=self.device) # Original 1D init
+
+        # targets = targets_det # Use detection targets for build_targets
+        tcls, tbox, indices, anchors = self.build_targets(det_pred, targets_det)  # targets
 
         # Losses
-        for i, pi in enumerate(p):  # layer index, layer predictions
+        for i, pi in enumerate(det_pred):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            tobj = torch.zeros_like(pi[..., 0], device=device)  # target obj
+            tobj = torch.zeros_like(pi[..., 0], device=self.device)  # target obj
 
             n = b.shape[0]  # number of targets
             if n:
@@ -473,14 +499,13 @@ class ComputeLoss:
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
+                    t = torch.full_like(ps[:, 5:], self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    #t[t==self.cp] = iou.detach().clamp(0).type(t.dtype)
                     lcls += self.BCEcls(ps[:, 5:], t)  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
-                #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
+                #     [file.write('%11.5g ' * 4 % tuple(x) + '\\n') for x in torch.cat((tbox[i], tcls[i][:, None]), 1)]
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
@@ -494,8 +519,26 @@ class ComputeLoss:
         lcls *= self.hyp['cls']
         bs = tobj.shape[0]  # batch size
 
-        loss = lbox + lobj + lcls
-        return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
+        # --- Horizon Loss Calculation ---
+        # Initialize horizon loss as 0D scalar
+        lhor = torch.zeros((), device=self.device)
+        # lhor = torch.zeros(1, device=self.device) # Original 1D init
+        if hor_pred is not None and targets_hor is not None:
+             # Simple MSE Loss - adjust if masking/validity checks needed later
+             # MSELoss with reduction='mean' returns a 0D scalar
+             lhor = self.horizon_loss_fn(hor_pred, targets_hor)
+
+        loss_det = lbox + lobj + lcls # Sum of 0D scalars is 0D
+        loss = loss_det + lhor * self.horizon_weight # Sum of 0D scalars is 0D
+        # loss = lbox + lobj + lcls # Original line
+
+        # Ensure all loss components are 1D before concatenating by unsqueezing the 0D scalars
+        loss_items = torch.cat((lbox.unsqueeze(0), 
+                                lobj.unsqueeze(0), 
+                                lcls.unsqueeze(0), 
+                                lhor.unsqueeze(0), 
+                                loss.unsqueeze(0))).detach()
+        return loss * bs, loss_items # Add lhor to loss items
 
     def build_targets(self, p, targets):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
@@ -1695,3 +1738,33 @@ class ComputeLossAuxOTA:
             anch.append(anchors[a])  # anchors
 
         return indices, anch
+
+
+class HorizonLoss(nn.Module):
+    def __init__(self, reg_max=16):
+        super(HorizonLoss, self).__init__()
+        self.reg_max = reg_max
+
+    def forward(self, pred, target, img_size):
+        """
+        Args:
+            pred: [batch_size, 2] where 2 is (y-intercept, slope)
+            target: [batch_size, 2] where 2 is (y-intercept, slope)
+            img_size: [height, width]
+        """
+        # Convert predictions to normalized coordinates
+        pred_y = pred[:, 0] * img_size[0]  # y-intercept
+        pred_slope = pred[:, 1] * 2 - 1  # slope normalized to [-1, 1]
+        
+        # Convert targets to normalized coordinates
+        target_y = target[:, 0] * img_size[0]
+        target_slope = target[:, 1] * 2 - 1
+        
+        # Compute losses
+        y_loss = F.l1_loss(pred_y, target_y)
+        slope_loss = F.l1_loss(pred_slope, target_slope)
+        
+        # Total loss
+        loss = y_loss + slope_loss
+        
+        return loss, torch.stack((y_loss, slope_loss))

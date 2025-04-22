@@ -385,6 +385,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
+        # Generate corresponding horizon label file paths (unconditionally)
+        self.horizon_label_files = [p.replace('/images/', '/labels/').replace('\\images\\', '\\labels\\').replace(Path(p).suffix, '.txt') 
+                                    for p in self.img_files]
+
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
@@ -535,7 +539,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
+        # Initialize horizon_target with a specific dummy tensor *before* mosaic check
+        # horizon_target = torch.zeros(2, dtype=torch.float32) # Original dummy
+        horizon_target = torch.tensor([0.5, 0.1], dtype=torch.float32) # New dummy for testing
         mosaic = self.mosaic and random.random() < hyp['mosaic']
+
         if mosaic:
             # Load mosaic
             if random.random() < 0.8:
@@ -566,6 +574,26 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+            # Load actual horizon labels only if not using mosaic (stays inside the else block)
+            if self.horizon_label_files:
+                horizon_label_path = Path(self.horizon_label_files[index])
+                if horizon_label_path.exists():
+                    try:
+                        with open(horizon_label_path, 'r') as f:
+                            # Read comma-separated values
+                            line = f.readline().strip()
+                            values = [float(x) for x in line.replace(',',' ').split()]
+                            if len(values) == 2:
+                                horizon_target = torch.tensor(values, dtype=torch.float32) # Overwrite dummy if file valid
+                            # else: # Silently ignore files not matching the 2-float format
+                                # print(f'Warning: Invalid format in horizon label file {horizon_label_path}. Expected 2 comma-separated floats.')
+                    except Exception as e:
+                        # Silently ignore errors during loading (e.g., non-float data)
+                        # print(f'Error reading horizon label file {horizon_label_path}: {e}')
+                        pass # Keep the default dummy tensor
+                # else: # Optional: Print warning if specific horizon label file is missing
+                    # print(f'Warning: Horizon label file not found for image index {index}: {horizon_label_path}')
 
         if self.augment:
             # Augment imagespace
@@ -626,40 +654,56 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        return torch.from_numpy(img), labels_out, horizon_target, self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        # img, label, path, shapes = zip(*batch)  # transposed, original
+        img, label, horizon_label, path, shapes = zip(*batch)  # transposed with horizon
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        # return torch.stack(img, 0), torch.cat(label, 0), path, shapes # Original return
+        return torch.stack(img, 0), torch.cat(label, 0), torch.stack(horizon_label, 0), path, shapes # Return with horizon labels stacked
 
     @staticmethod
     def collate_fn4(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        img, labels, path, shapes = zip(*batch)  # transposed
         n = len(shapes) // 4
-        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+        img4, labels4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
-        ho = torch.tensor([[0., 0, 0, 1, 0, 0]])
-        wo = torch.tensor([[0., 0, 1, 0, 0, 0]])
-        s = torch.tensor([[1, 1, .5, .5, .5, .5]])  # scale
-        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
-            i *= 4
-            if random.random() < 0.5:
-                im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2., mode='bilinear', align_corners=False)[
-                    0].type(img[i].type())
-                l = label[i]
-            else:
-                im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
-                l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
-            img4.append(im)
-            label4.append(l)
+        ho = torch.tensor([[0., 0, 0, 1, 0, 0], [0, 0, 1, 0, 0, 0]]).T  # horizontal flip matrix
+        vo = torch.tensor([[0., 1, 0, 0, 0, 0], [1, 0, 0, 0, 1, 0]]).T  # vertical flip matrix
+        rot90 = torch.tensor([[1., 0, 0, 0, 1, 0], [0, 1, 0, 0, 0, 1]]).T  # rotate 90 deg matrix
 
-        for i, l in enumerate(label4):
-            l[:, 0] = i  # add target image index for build_targets()
+        bits = torch.randint(0, 16, (n,), dtype=torch.int32)
+        for i in range(n):
+            img_ = torch.zeros((4, *img[i].shape), dtype=img[i].dtype)
+            labels_ = torch.zeros((0, 5), dtype=labels[i].dtype)
+            ti = bits[i]
+            v = vo * torch.randint(0, 2, (1,)).float() + ho * torch.randint(0, 2, (1,)).float() + rot90 * torch.randint(0, 2, (1,)).float()
+            img_[:4] = img[i]
+            labels_ = labels[i]
+            if ti % 2:
+                img_ = torch.flip(img_, [2])
+                labels_ = torch.flip(labels_, [0])
+            if ti // 2 % 2:
+                img_ = torch.transpose(img_, 2, 3)
+                labels_ = torch.transpose(labels_, 0, 1)
+            if ti // 4 % 2:
+                img_ = torch.rot90(img_, 1, [2, 3])
+                labels_ = torch.rot90(labels_, 1, [0, 1])
+            if ti // 8 % 2:
+                img_ = torch.rot90(img_, 2, [2, 3])
+                labels_ = torch.rot90(labels_, 2, [0, 1])
+            if ti // 16 % 2:
+                img_ = torch.rot90(img_, 3, [2, 3])
+                labels_ = torch.rot90(labels_, 3, [0, 1])
+            img4.append(img_)
+            labels4.append(labels_)
+            path4.append(path[i])
+            shapes4.append(shapes[i])
 
-        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
+        return torch.stack(img4, 0), torch.cat(labels4, 0), path4, shapes4
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
