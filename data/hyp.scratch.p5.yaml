@@ -5,7 +5,7 @@ weight_decay: 0.0005  # optimizer weight decay 5e-4
 warmup_epochs: 3.0  # warmup epochs (fractions ok)
 warmup_momentum: 0.8  # warmup initial momentum
 warmup_bias_lr: 0.1  # warmup initial bias lr
-distance: 0.05  # distance loss gain
+distance: 0.03  # distance loss gain
 normalization_strategy: "linear" #log, linear, log_negative, linear_negative
 max_distance: 1000 #1000 . could also be 500 or 2000
 dist_loss: "L1" #1L1, L2, ...

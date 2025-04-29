@@ -201,7 +201,7 @@ def detect(save_img=False):
                 # substitute by your object detector, output has to be N X (x, y, x, y, conf, cls)
                 # dets = np.array([[144, 212, 578, 480, 0.82, 0],
                 #                  [425, 281, 576, 472, 0.56, 65]])
-
+                #TODO distance predictions are not passed i believe
                 updated_dets = tracker.update(np.array(det[:,:-1].cpu()), im0)  # --> M X (x, y, x, y, id, conf, cls, ind)
                 tracker.plot_results(im0, show_trajectories=True)
 

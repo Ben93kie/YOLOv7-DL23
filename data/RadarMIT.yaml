@@ -1,0 +1,12 @@
+train: /data/CombinedDatasetsRadar_distyolo2/train
+val: /data/CombinedDatasetsRadar_distyolo2/val
+test: /data/CombinedDatasetsRadar_distyolo2/test
+nc: 2
+names: ['boat', 'other']
+
+#train: /home/kiefer/Downloads/CombinedDatasets18_dist/images/train
+#val: /home/kiefer/Downloads/CombinedDatasets18_dist/images/train
+#test: /home/kiefer/Downloads/CombinedDatasets18_dist/images/train
+#nc: 2
+#names: ['boat', 'other']
+
