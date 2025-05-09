@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from boxmot import DeepOCSORT, StrongSORT, BoTSORT, BYTETracker, HybridSORT, OCSORT
+from boxmot import DeepOCSORT, StrongSORT, BoTSORT, BYTETracker, OCSORT
+from hybridsort_local import HybridSORT
 import argparse
 import time
 from pathlib import Path
@@ -202,7 +203,8 @@ def detect(save_img=False):
                 # dets = np.array([[144, 212, 578, 480, 0.82, 0],
                 #                  [425, 281, 576, 472, 0.56, 65]])
                 #TODO distance predictions are not passed i believe
-                updated_dets = tracker.update(np.array(det[:,:-1].cpu()), im0)  # --> M X (x, y, x, y, id, conf, cls, ind)
+                # updated_dets = tracker.update(np.array(det[:,:-1].cpu()), im0)  # --> M X (x, y, x, y, id, conf, cls, ind)
+                updated_dets = tracker.update(np.array(det.cpu()), im0)  # --> M X (x, y, x, y, id, conf, cls, ind)
                 tracker.plot_results(im0, show_trajectories=True)
 
 
