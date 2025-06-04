@@ -99,7 +99,7 @@ head:
    [-1, 1, Conv, [64, 3, 1]],
    [[-1, -2], 1, Concat, [1]], # Less complex concat
    [-1, 1, Conv, [128, 1, 1]], # 71 (Simplified P3 features)
-      
+
    # Generate P3, P4, P5 outputs using RepConv directly from feature layers
    [71, 1, RepConv, [256, 3, 1]],  # 72 (P3 Output)
    [61, 1, RepConv, [512, 3, 1]],  # 73 (P4 Output)
