@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import sys
 from copy import deepcopy
 
@@ -505,6 +506,163 @@ class IBin(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
+class MultiHeadDetect(nn.Module):
+    """Multi-head detection module with specialized heads for different object types"""
+    stride = None  # strides computed during build
+    export = False  # onnx export
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, anchors=(), ch=(), head_configs=None):
+        super(MultiHeadDetect, self).__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        print(f"DEBUG: MultiHeadDetect init - nl={self.nl}, na={self.na}, anchors type={type(anchors)}")
+        
+        # Default head configuration if none provided
+        if head_configs is None:
+            head_configs = [
+                {'name': 'general', 'classes': list(range(nc)), 'weight': 1.0}
+            ]
+        
+        self.head_configs = head_configs
+        self.num_heads = len(head_configs)
+        
+        # Setup anchors
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)  # shape(nl,na,2)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        
+        # Create detection heads for each specialized head
+        self.heads = nn.ModuleDict()
+        for head_config in head_configs:
+            head_name = head_config['name']
+            head_nc = len(head_config['classes'])
+            head_no = head_nc + 5  # number of outputs per anchor (bbox + obj + classes)
+            
+            # Special case: if this is the only head and covers all classes, use the original nc
+            if len(head_configs) == 1 and len(head_config['classes']) == self.nc:
+                head_no = self.nc + 5  # Use original number of classes
+                print(f"DEBUG: Single head with all classes detected. head_no = {head_no}, total outputs = {head_no * self.na}")
+            else:
+                print(f"DEBUG: Head '{head_name}': {len(head_configs)} heads, {len(head_config['classes'])} classes vs {self.nc} total, head_no = {head_no}, total outputs = {head_no * self.na}")
+            
+            # Create convolution layers for this head
+            head_convs = nn.ModuleList(nn.Conv2d(x, head_no * self.na, 1) for x in ch)
+            self.heads[head_name] = head_convs
+        
+        # Shared feature processing layers (optional)
+        self.shared_conv = nn.ModuleList(nn.Conv2d(x, x, 1) for x in ch)
+
+    def forward(self, x):
+        z = []  # inference output
+        head_outputs = {}  # outputs from each head
+        self.training |= self.export
+        
+        # Process each detection head directly (skip shared processing for now)
+        for head_config in self.head_configs:
+            head_name = head_config['name']
+            head_nc = len(head_config['classes'])
+            head_no = head_nc + 5
+            head_z = []
+            
+            for i in range(self.nl):
+                # Apply head-specific convolution directly to input
+                head_x = self.heads[head_name][i](x[i])
+                bs, _, ny, nx = head_x.shape
+                head_x = head_x.view(bs, self.na, head_no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+                
+                if not self.training:  # inference
+                    if self.grid[i].shape[2:4] != head_x.shape[2:4]:
+                        self.grid[i] = self._make_grid(nx, ny).to(head_x.device)
+                    
+                    y = head_x.sigmoid()
+                    if not torch.onnx.is_in_onnx_export():
+                        y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                        y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    else:
+                        xy, wh, conf = y.split((2, 2, head_nc + 1), 4)
+                        xy = xy * (2. * self.stride[i]) + (self.stride[i] * (self.grid[i] - 0.5))  # new xy
+                        wh = wh ** 2 * (4 * self.anchor_grid[i].data)  # new wh
+                        y = torch.cat((xy, wh, conf), 4)
+                    
+                    head_z.append(y.view(bs, -1, head_no))
+            
+            # Store head output
+            if self.training:
+                head_outputs[head_name] = [x[i] for i in range(self.nl)]  # Use original features for training
+            else:
+                head_outputs[head_name] = torch.cat(head_z, 1)
+        
+        # Combine outputs based on training/inference mode
+        if self.training:
+            # Return all head outputs for training
+            return head_outputs
+        else:
+            # Combine inference outputs from all heads
+            combined_output = self._combine_head_outputs(head_outputs)
+            return combined_output
+
+    def _combine_head_outputs(self, head_outputs):
+        """Combine outputs from multiple heads into single detection tensor"""
+        if len(head_outputs) == 1:
+            # Single head case
+            return list(head_outputs.values())[0]
+        
+        # Multi-head case: pad outputs to same size and concatenate
+        combined_detections = []
+        max_classes = max(len(cfg['classes']) for cfg in self.head_configs)
+        
+        for head_name, head_output in head_outputs.items():
+            head_config = next(cfg for cfg in self.head_configs if cfg['name'] == head_name)
+            head_nc = len(head_config['classes'])
+            weight = head_config.get('weight', 1.0)
+            
+            # Apply head-specific weighting
+            if weight != 1.0:
+                head_output = head_output * weight
+            
+            # Pad the class predictions to match the largest head
+            if head_nc < max_classes:
+                bs, num_anchors, current_size = head_output.shape
+                # Split into bbox (4), objectness (1), and classes
+                bbox_obj = head_output[..., :5]  # bbox + objectness
+                classes = head_output[..., 5:]   # class predictions
+                
+                # Pad classes with zeros
+                padding_size = max_classes - head_nc
+                padding = torch.zeros(bs, num_anchors, padding_size, device=head_output.device)
+                padded_classes = torch.cat([classes, padding], dim=-1)
+                
+                # Recombine
+                head_output = torch.cat([bbox_obj, padded_classes], dim=-1)
+            
+            combined_detections.append(head_output)
+        
+        # Concatenate along detection dimension
+        return torch.cat(combined_detections, dim=1)
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+    def convert(self, z):
+        z = torch.cat(z, 1) if isinstance(z, list) else z
+        box = z[:, :, :4]
+        conf = z[:, :, 4:5]
+        score = z[:, :, 5:]
+        score *= conf
+        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
+                                           dtype=torch.float32,
+                                           device=z.device)
+        box @= convert_matrix                          
+        return (box, score)
+
+
 class Model(nn.Module):
     def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super(Model, self).__init__()
@@ -572,6 +730,14 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases_kpt()  # only run once
             # print('Strides: %s' % m.stride.tolist())
+        if isinstance(m, MultiHeadDetect):
+            s = 256  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            check_anchor_order(m)
+            m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            self._initialize_multihead_biases()  # only run once
+            # print('Strides: %s' % m.stride.tolist())
 
         # Init weights, biases
         initialize_weights(self)
@@ -608,11 +774,11 @@ class Model(nn.Module):
                 self.traced=False
 
             if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint) or isinstance(m, MultiHeadDetect):
                     break
 
             if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin, MultiHeadDetect))
                 o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
                 for _ in range(10):
                     m(x.copy() if c else x)
@@ -678,6 +844,19 @@ class Model(nn.Module):
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
             b.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+
+    def _initialize_multihead_biases(self, cf=None):  # initialize biases into MultiHeadDetect(), cf is class frequency
+        # https://arxiv.org/abs/1708.02002 section 3.3
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
+        m = self.model[-1]  # MultiHeadDetect() module
+        for head_name, head_convs in m.heads.items():
+            head_config = next(cfg for cfg in m.head_configs if cfg['name'] == head_name)
+            head_nc = len(head_config['classes'])
+            for mi, s in zip(head_convs, m.stride):  # from
+                b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+                b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+                b.data[:, 5:] += math.log(0.6 / (head_nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
         m = self.model[-1]  # Detect() module
