@@ -69,35 +69,66 @@ def create_exact_multihead_model(standard_model, device):
         head_configs=head_configs
     )
     
-    # Copy the stride and other properties
-    multihead_detect.stride = detect_layer.stride.clone()
-    multihead_detect.anchors = detect_layer.anchors.clone()
-    multihead_detect.anchor_grid = detect_layer.anchor_grid.clone()
+    # Move the multi-head detect to the correct device immediately
+    multihead_detect.to(device)
+    
+    # Copy the stride and other properties, ensuring they're on the correct device
+    multihead_detect.stride = detect_layer.stride.clone().to(device)
+    multihead_detect.anchors = detect_layer.anchors.clone().to(device)
+    multihead_detect.anchor_grid = detect_layer.anchor_grid.clone().to(device)
     
     # Add implicit layers to MultiHeadDetect to match IDetect exactly
     from models.common import ImplicitA, ImplicitM
     
-    # Add implicit layers for the general head
-    multihead_detect.ia = torch.nn.ModuleList([ImplicitA(x) for x in input_channels])
-    multihead_detect.im = torch.nn.ModuleList([ImplicitM(21) for _ in input_channels])  # 21 = (2+5)*3
+    # Create implicit layers and immediately move them to the correct device
+    ia_layers = []
+    im_layers = []
+    
+    for i, ch in enumerate(input_channels):
+        # Create ImplicitA layer and move to device
+        ia_layer = ImplicitA(ch)
+        ia_layer.to(device)
+        ia_layers.append(ia_layer)
+        
+        # Create ImplicitM layer and move to device
+        im_layer = ImplicitM(21)  # 21 = (2+5)*3
+        im_layer.to(device)
+        im_layers.append(im_layer)
+    
+    multihead_detect.ia = torch.nn.ModuleList(ia_layers)
+    multihead_detect.im = torch.nn.ModuleList(im_layers)
     
     # Copy weights from standard detection layer
     for i, (std_conv, mh_conv) in enumerate(zip(detect_layer.m, multihead_detect.heads['general'])):
         mh_conv.weight.data.copy_(std_conv.weight.data)
         mh_conv.bias.data.copy_(std_conv.bias.data)
     
-    # Copy implicit layer weights
+    # Copy implicit layer weights and ensure they're on the correct device
     for i, (std_ia, mh_ia) in enumerate(zip(detect_layer.ia, multihead_detect.ia)):
-        mh_ia.implicit.data.copy_(std_ia.implicit.data)
+        # Ensure both source and destination are on the same device
+        std_implicit = std_ia.implicit.data.to(device)
+        mh_ia.implicit.data.copy_(std_implicit)
+        # Explicitly move the implicit layer to device
+        mh_ia.to(device)
     
     for i, (std_im, mh_im) in enumerate(zip(detect_layer.im, multihead_detect.im)):
-        mh_im.implicit.data.copy_(std_im.implicit.data)
+        # Ensure both source and destination are on the same device
+        std_implicit = std_im.implicit.data.to(device)
+        mh_im.implicit.data.copy_(std_implicit)
+        # Explicitly move the implicit layer to device
+        mh_im.to(device)
     
     # Modify the forward method to use implicit layers like IDetect
     def forward_with_implicit(self, x):
         z = []  # inference output
         head_outputs = {}  # outputs from each head
         self.training |= self.export
+        
+        # Get the device from input tensor
+        input_device = x[0].device
+        
+        # Ensure all model components are on the same device as input
+        self.to(input_device)
         
         # Process the general head with implicit layers (like IDetect)
         head_config = self.head_configs[0]  # Only one head
@@ -107,8 +138,11 @@ def create_exact_multihead_model(standard_model, device):
         head_z = []
         
         for i in range(self.nl):
+            # Ensure input is on the correct device
+            x_input = x[i].to(input_device)
+            
             # Apply implicit layers like IDetect does
-            x_processed = self.ia[i](x[i])  # ImplicitA
+            x_processed = self.ia[i](x_input)  # ImplicitA
             head_x = self.heads[head_name][i](x_processed)  # Conv
             head_x = self.im[i](head_x)  # ImplicitM
             
@@ -117,11 +151,16 @@ def create_exact_multihead_model(standard_model, device):
             
             if not self.training:  # inference
                 if self.grid[i].shape[2:4] != head_x.shape[2:4]:
-                    self.grid[i] = self._make_grid(nx, ny).to(head_x.device)
+                    self.grid[i] = self._make_grid(nx, ny).to(input_device)
                 
                 y = head_x.sigmoid()
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                # Ensure all tensors are on the same device as the input
+                grid_i = self.grid[i].to(input_device)
+                stride_i = self.stride[i].to(input_device)
+                anchor_grid_i = self.anchor_grid[i].to(input_device)
+                
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_i) * stride_i  # xy
+                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * anchor_grid_i  # wh
                 head_z.append(y.view(bs, -1, head_no))
         
         # Store head output
@@ -152,6 +191,10 @@ def create_exact_multihead_model(standard_model, device):
     # Replace the detection layer in the model
     multihead_model = deepcopy(standard_model)
     multihead_model.model[-1] = multihead_detect
+    
+    # Ensure the entire model is on the correct device
+    multihead_model.to(device)
+    multihead_detect.to(device)
     
     # Ensure the model is in evaluation mode
     multihead_model.eval()
@@ -214,11 +257,36 @@ def compare_tensors(tensor1, tensor2, name="tensors", tolerance=1e-6):
         return False
 
 def main():
-    # Configuration
-    weights_path = r"C:\Users\ben93\My Drive\Weights\flibs\flibs.pt"
-    img_path = r"C:\Users\ben93\Downloads\fig03_hd.png"
+    # Configuration - make paths flexible for different environments
+    weights_path = r"G:\Meine Ablage\Weights\flibs\flibs.pt"  # Updated path
+    img_path = r"C:\Users\kiefer\PycharmProjects\YOLOv7-DL23\detection_results\original_image.jpg"  # Updated path
     device = select_device('')
     img_size = 640
+    
+    # Fallback paths if the above don't exist
+    fallback_weights = [
+        r"C:\Users\ben93\My Drive\Weights\flibs\flibs.pt",
+        r"G:\Meine Ablage\Weights\flibs\flibs.pt",
+        "flibs.pt"
+    ]
+    
+    fallback_images = [
+        r"C:\Users\kiefer\PycharmProjects\YOLOv7-DL23\detection_results\original_image.jpg",
+        r"C:\Users\ben93\Downloads\fig03_hd.png",
+        "detection_results/original_image.jpg"
+    ]
+    
+    # Find existing weights file
+    for w_path in fallback_weights:
+        if Path(w_path).exists():
+            weights_path = w_path
+            break
+    
+    # Find existing image file
+    for i_path in fallback_images:
+        if Path(i_path).exists():
+            img_path = i_path
+            break
     
     print("🎯 Exact Comparison: Standard vs Multi-Head Detection")
     print(f"Weights: {weights_path}")
