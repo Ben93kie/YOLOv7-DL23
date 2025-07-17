@@ -16,6 +16,7 @@ sys.path.append('./')
 
 from models.yolo import Model, MultiHeadDetect
 from utils.general import non_max_suppression, scale_coords, check_img_size
+from utils.nms_with_indices import non_max_suppression_with_indices
 from utils.torch_utils import select_device
 from utils.datasets import letterbox
 
@@ -56,9 +57,11 @@ def create_exact_multihead_model(standard_model, device):
         layer_anchors = detect_layer.anchors[i].flatten().tolist()
         anchors_list.append(layer_anchors)
     
-    # Create single-head config that exactly matches the standard model
+    # Create multi-head config with general, distance, and heading heads
     head_configs = [
-        {'name': 'general', 'classes': list(range(detect_layer.nc)), 'weight': 1.0}
+        {'name': 'general', 'classes': list(range(detect_layer.nc)), 'weight': 1.0, 'output_size': detect_layer.nc + 5},
+        {'name': 'distance', 'classes': [0], 'weight': 1.0, 'output_size': 1},  # Only distance value
+        {'name': 'heading', 'classes': [0], 'weight': 1.0, 'output_size': 1}    # Only heading value
     ]
     
     # Create new multi-head detection layer
@@ -98,10 +101,32 @@ def create_exact_multihead_model(standard_model, device):
     multihead_detect.ia = torch.nn.ModuleList(ia_layers)
     multihead_detect.im = torch.nn.ModuleList(im_layers)
     
-    # Copy weights from standard detection layer
+    # Manually create convolution layers with correct output sizes for each head
+    # This overrides the default MultiHeadDetect behavior
+    multihead_detect.heads = torch.nn.ModuleDict()
+    
+    for head_config in head_configs:
+        head_name = head_config['name']
+        head_output_size = head_config.get('output_size', len(head_config['classes']) + 5)
+        
+        # Create convolution layers for this head with correct output size
+        head_convs = torch.nn.ModuleList()
+        for ch in input_channels:
+            conv = torch.nn.Conv2d(ch, head_output_size * multihead_detect.na, 1)
+            head_convs.append(conv)
+        
+        multihead_detect.heads[head_name] = head_convs
+        print(f"Created {head_name} head with output size {head_output_size} per anchor ({head_output_size * multihead_detect.na} total)")
+    
+    # Move all heads to device
+    multihead_detect.heads.to(device)
+    
+    # Copy weights from standard detection layer to general head only
     for i, (std_conv, mh_conv) in enumerate(zip(detect_layer.m, multihead_detect.heads['general'])):
         mh_conv.weight.data.copy_(std_conv.weight.data)
         mh_conv.bias.data.copy_(std_conv.bias.data)
+    
+    # Distance and heading heads keep their random initialization (untrained)
     
     # Copy implicit layer weights and ensure they're on the correct device
     for i, (std_ia, mh_ia) in enumerate(zip(detect_layer.ia, multihead_detect.ia)):
@@ -118,7 +143,7 @@ def create_exact_multihead_model(standard_model, device):
         # Explicitly move the implicit layer to device
         mh_im.to(device)
     
-    # Modify the forward method to use implicit layers like IDetect
+    # Modify the forward method to use implicit layers and process all heads
     def forward_with_implicit(self, x):
         z = []  # inference output
         head_outputs = {}  # outputs from each head
@@ -130,50 +155,62 @@ def create_exact_multihead_model(standard_model, device):
         # Ensure all model components are on the same device as input
         self.to(input_device)
         
-        # Process the general head with implicit layers (like IDetect)
-        head_config = self.head_configs[0]  # Only one head
-        head_name = head_config['name']
-        head_nc = len(head_config['classes'])
-        head_no = head_nc + 5
-        head_z = []
-        
-        for i in range(self.nl):
-            # Ensure input is on the correct device
-            x_input = x[i].to(input_device)
+        # Process all heads
+        for head_config in self.head_configs:
+            head_name = head_config['name']
+            head_nc = len(head_config['classes'])
+            # Use output_size if specified, otherwise default to standard YOLO format
+            head_no = head_config.get('output_size', head_nc + 5)
+            head_z = []
             
-            # Apply implicit layers like IDetect does
-            x_processed = self.ia[i](x_input)  # ImplicitA
-            head_x = self.heads[head_name][i](x_processed)  # Conv
-            head_x = self.im[i](head_x)  # ImplicitM
-            
-            bs, _, ny, nx = head_x.shape
-            head_x = head_x.view(bs, self.na, head_no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
-            
-            if not self.training:  # inference
-                if self.grid[i].shape[2:4] != head_x.shape[2:4]:
-                    self.grid[i] = self._make_grid(nx, ny).to(input_device)
+            for i in range(self.nl):
+                # Ensure input is on the correct device
+                x_input = x[i].to(input_device)
                 
-                y = head_x.sigmoid()
-                # Ensure all tensors are on the same device as the input
-                grid_i = self.grid[i].to(input_device)
-                stride_i = self.stride[i].to(input_device)
-                anchor_grid_i = self.anchor_grid[i].to(input_device)
+                # Apply implicit layers for general head only (others use raw features)
+                if head_name == 'general':
+                    x_processed = self.ia[i](x_input)  # ImplicitA
+                    head_x = self.heads[head_name][i](x_processed)  # Conv
+                    head_x = self.im[i](head_x)  # ImplicitM
+                else:
+                    # Distance and heading heads use raw features (no implicit layers)
+                    head_x = self.heads[head_name][i](x_input)  # Conv only
                 
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_i) * stride_i  # xy
-                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * anchor_grid_i  # wh
-                head_z.append(y.view(bs, -1, head_no))
+                bs, _, ny, nx = head_x.shape
+                head_x = head_x.view(bs, self.na, head_no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+                
+                if not self.training:  # inference
+                    if self.grid[i].shape[2:4] != head_x.shape[2:4]:
+                        self.grid[i] = self._make_grid(nx, ny).to(input_device)
+                    
+                    y = head_x.sigmoid()
+                    
+                    # Only apply YOLO post-processing to general head (which has bbox format)
+                    if head_name == 'general' and head_no >= 5:
+                        # Ensure all tensors are on the same device as the input
+                        grid_i = self.grid[i].to(input_device)
+                        stride_i = self.stride[i].to(input_device)
+                        anchor_grid_i = self.anchor_grid[i].to(input_device)
+                        
+                        y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + grid_i) * stride_i  # xy
+                        y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * anchor_grid_i  # wh
+                    # For distance/heading heads, just use the raw sigmoid output
+                    
+                    head_z.append(y.view(bs, -1, head_no))
+            
+            # Store head output
+            if self.training:
+                head_outputs[head_name] = [x[i] for i in range(self.nl)]
+            else:
+                head_outputs[head_name] = torch.cat(head_z, 1)
         
-        # Store head output
-        if self.training:
-            head_outputs[head_name] = [x[i] for i in range(self.nl)]
-        else:
-            head_outputs[head_name] = torch.cat(head_z, 1)
-        
-        # Return single head output (since we only have one)
+        # Return all head outputs for multi-head processing
         if self.training:
             return head_outputs
         else:
-            return head_outputs[head_name]
+            # For inference, return the general head for NMS compatibility, but store all outputs
+            self.last_head_outputs = head_outputs  # Store for later access
+            return head_outputs['general']
     
     # Replace the forward method
     multihead_detect.forward = forward_with_implicit.__get__(multihead_detect, MultiHeadDetect)
@@ -223,7 +260,7 @@ def preprocess_image(img_path, img_size=640):
     
     return img, img0
 
-def run_inference(model, img_tensor, device, conf_thres=0.25, iou_thres=0.45):
+def run_inference(model, img_tensor, device, conf_thres=0.25, iou_thres=0.45, return_indices=False):
     """Run inference on image"""
     img_tensor = img_tensor.to(device)
     
@@ -235,10 +272,98 @@ def run_inference(model, img_tensor, device, conf_thres=0.25, iou_thres=0.45):
         if isinstance(pred, tuple):
             pred = pred[0]  # Take the first element if it's a tuple
     
-    # Apply NMS
-    pred = non_max_suppression(pred, conf_thres, iou_thres)
+    # Apply NMS with optional index tracking
+    if return_indices:
+        pred, indices = non_max_suppression_with_indices(pred, conf_thres, iou_thres, return_indices=True)
+        return pred, indices
+    else:
+        pred = non_max_suppression(pred, conf_thres, iou_thres)
+        return pred
+
+def extract_head_values_for_detections(model, img_tensor, detections, detection_indices, device):
+    """Extract distance and heading values for specific detections using tracked indices"""
+    if detections is None or len(detections) == 0:
+        return [], []
     
-    return pred
+    # Get the detection layer
+    detect_layer = model.model[-1]
+    if not hasattr(detect_layer, 'last_head_outputs'):
+        return [], []
+    
+    head_outputs = detect_layer.last_head_outputs
+    
+    # Get distance and heading outputs
+    distance_output = head_outputs.get('distance', None)
+    heading_output = head_outputs.get('heading', None)
+    
+    if distance_output is None or heading_output is None:
+        return [], []
+    
+    detection_distances = []
+    detection_headings = []
+    
+    # Use the tracked indices to extract the correct head values
+    for i, original_idx in enumerate(detection_indices):
+        if original_idx >= 0 and original_idx < distance_output.shape[1]:
+            # Extract the exact head values that correspond to this detection
+            dist_val = distance_output[0, original_idx, 0].item()  # [batch, original_anchor_idx, value]
+            head_val = heading_output[0, original_idx, 0].item()
+            detection_distances.append(dist_val)
+            detection_headings.append(head_val)
+        else:
+            # Fallback for invalid indices (e.g., autolabels)
+            detection_distances.append(0.0)
+            detection_headings.append(0.0)
+    
+    return detection_distances, detection_headings
+
+
+
+def draw_detections(img, detections, img_shape, class_names=None, title="Detections"):
+    """Draw bounding boxes on image"""
+    if class_names is None:
+        class_names = {0: 'Object_A', 1: 'Object_B'}
+    
+    # Colors for different classes
+    colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+    
+    # Copy image
+    img_with_boxes = img.copy()
+    
+    if detections is not None and len(detections) > 0:
+        # Scale coordinates back to original image size
+        detections[:, :4] = scale_coords(img_shape, detections[:, :4], img.shape).round()
+        
+        for i, det in enumerate(detections):
+            x1, y1, x2, y2, conf, cls = det.tolist()
+            x1, y1, x2, y2, cls = int(x1), int(y1), int(x2), int(y2), int(cls)
+            
+            # Choose color based on class
+            color = colors[cls % len(colors)]
+            
+            # Draw bounding box
+            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label
+            class_name = class_names.get(cls, f'Class_{cls}')
+            label = f'{class_name}: {conf:.3f}'
+            
+            # Get text size for background
+            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            
+            # Draw background rectangle for text
+            cv2.rectangle(img_with_boxes, (x1, y1 - text_height - baseline - 5), 
+                         (x1 + text_width, y1), color, -1)
+            
+            # Draw text
+            cv2.putText(img_with_boxes, label, (x1, y1 - baseline - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Add title
+    cv2.putText(img_with_boxes, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(img_with_boxes, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1)
+    
+    return img_with_boxes
 
 def compare_tensors(tensor1, tensor2, name="tensors", tolerance=1e-6):
     """Compare two tensors with detailed output"""
@@ -344,14 +469,47 @@ def main():
         std_detections = len(pred_standard[0]) if pred_standard[0] is not None else 0
         print(f"   Detections: {std_detections}")
         
-        # Run inference with multi-head model
+        # Run inference with multi-head model (with index tracking)
         print("🚀 Running inference with multi-head model...")
         start_time = time.time()
-        pred_multihead = run_inference(multihead_model, img_tensor, device)
+        pred_multihead, detection_indices = run_inference(multihead_model, img_tensor, device, return_indices=True)
         multihead_time = time.time() - start_time
         print(f"✅ Multi-head inference completed in {multihead_time:.3f}s")
         mh_detections = len(pred_multihead[0]) if pred_multihead[0] is not None else 0
         print(f"   Detections: {mh_detections}")
+        if mh_detections > 0:
+            print(f"   Detection indices: {detection_indices[0].tolist()}")
+        
+        # Extract outputs from all heads
+        print("\n🔍 Multi-Head Outputs Analysis:")
+        detect_layer = multihead_model.model[-1]
+        if hasattr(detect_layer, 'last_head_outputs'):
+            head_outputs = detect_layer.last_head_outputs
+            
+            for head_name, head_output in head_outputs.items():
+                print(f"\n📊 {head_name.upper()} Head Output:")
+                print(f"   Shape: {head_output.shape}")
+                print(f"   Min value: {head_output.min().item():.6f}")
+                print(f"   Max value: {head_output.max().item():.6f}")
+                print(f"   Mean value: {head_output.mean().item():.6f}")
+                print(f"   Std value: {head_output.std().item():.6f}")
+                
+                # Show some sample values from the head
+                if head_output.numel() > 0:
+                    # Get first detection's values for this head
+                    sample_values = head_output[0, :5].flatten()  # First 5 values
+                    print(f"   Sample values: {[f'{v:.4f}' for v in sample_values.tolist()]}")
+                    
+                    if head_name == 'distance':
+                        print(f"   💡 Distance head produces untrained outputs (random-like values)")
+                        print(f"      These would represent distance predictions after training")
+                    elif head_name == 'heading':
+                        print(f"   💡 Heading head produces untrained outputs (random-like values)")
+                        print(f"      These would represent heading/angle predictions after training")
+                    elif head_name == 'general':
+                        print(f"   💡 General head uses trained weights (produces actual detections)")
+        else:
+            print("   ⚠️  Head outputs not stored - check forward method implementation")
         
         # Compare final detection results
         print("\n🔍 Comparing final detection results...")
@@ -370,17 +528,30 @@ def main():
             else:
                 print("⚠️  Detections differ slightly")
             
-            # Print actual detection values for comparison
+            # Print actual detection values
             print(f"\n📋 Detection Values Comparison:")
+            
             print(f"Standard Model Detections ({std_detections} detections):")
             for i, det in enumerate(pred_standard[0]):
                 x1, y1, x2, y2, conf, cls = det.tolist()
                 print(f"  Detection {i+1}: bbox=[{x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}], conf={conf:.4f}, class={int(cls)}")
             
             print(f"\nMulti-Head Model Detections ({mh_detections} detections):")
+            
+            # Extract corresponding distance and heading values for each detection
+            detection_distances, detection_headings = extract_head_values_for_detections(
+                multihead_model, img_tensor, pred_multihead[0], detection_indices[0], device
+            )
+            
             for i, det in enumerate(pred_multihead[0]):
                 x1, y1, x2, y2, conf, cls = det.tolist()
+                
+                # Get corresponding distance and heading values
+                distance_val = detection_distances[i] if i < len(detection_distances) else "N/A"
+                heading_val = detection_headings[i] if i < len(detection_headings) else "N/A"
+                
                 print(f"  Detection {i+1}: bbox=[{x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f}], conf={conf:.4f}, class={int(cls)}")
+                print(f"                   distance={distance_val:.4f}, heading={heading_val:.4f} (from model heads)")
             
             # Show exact differences
             if std_detections > 0:
@@ -394,6 +565,46 @@ def main():
                 print(f"  Maximum difference across all values: {torch.max(diff_tensor).item():.2e}")
                 print(f"  Mean difference across all values: {torch.mean(diff_tensor).item():.2e}")
                 print(f"  Standard deviation of differences: {torch.std(diff_tensor).item():.2e}")
+        
+        # Generate and save visualization images
+        print("\n🎨 Generating visualization images...")
+        
+        # Class names for visualization
+        class_names = {0: 'Object_A', 1: 'Object_B'}
+        
+        # Draw detections on images
+        img_standard = draw_detections(
+            img0, 
+            pred_standard[0] if pred_standard[0] is not None else None,
+            img_tensor.shape[2:],  # Shape of processed image
+            class_names,
+            "Standard Model Detections"
+        )
+        
+        img_multihead = draw_detections(
+            img0, 
+            pred_multihead[0] if pred_multihead[0] is not None else None,
+            img_tensor.shape[2:],  # Shape of processed image
+            class_names,
+            "Multi-Head Model Detections"
+        )
+        
+        # Save images
+        output_dir = Path("detection_results")
+        output_dir.mkdir(exist_ok=True)
+        
+        standard_output = output_dir / "standard_model_detections.jpg"
+        multihead_output = output_dir / "multihead_model_detections.jpg"
+        original_output = output_dir / "original_image.jpg"
+        
+        cv2.imwrite(str(standard_output), img_standard)
+        cv2.imwrite(str(multihead_output), img_multihead)
+        cv2.imwrite(str(original_output), img0)
+        
+        print(f"✅ Visualization images saved:")
+        print(f"   Original: {original_output}")
+        print(f"   Standard model: {standard_output}")
+        print(f"   Multi-head model: {multihead_output}")
         
         # Performance comparison
         print("\n📊 Performance Comparison:")
