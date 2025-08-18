@@ -383,7 +383,7 @@ def compare_tensors(tensor1, tensor2, name="tensors", tolerance=1e-6):
 
 def main():
     # Configuration - make paths flexible for different environments
-    weights_path = r"G:\Meine Ablage\Weights\flibs\flibs.pt"  # Updated path
+    weights_path = "/home/kiefer/Downloads/flibs.pt"  # Updated path
     img_path = r"C:\Users\kiefer\PycharmProjects\YOLOv7-DL23\detection_results\original_image.jpg"  # Updated path
     device = select_device('')
     img_size = 640
@@ -393,6 +393,7 @@ def main():
         r"C:\Users\ben93\My Drive\Weights\flibs\flibs.pt",
         r"G:\Meine Ablage\Weights\flibs\flibs.pt",
         "flibs.pt"
+        "/home/kiefer/Downloads/flibs.pt"
     ]
     
     fallback_images = [
