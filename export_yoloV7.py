@@ -59,7 +59,7 @@ def main(args):
         print('\nCreating labels.txt file')
         f = open('labels.txt', 'w')
         for name in model.names:
-            f.write(name + '\n')
+            f.write(str(name) + '\n')
         f.close()
 
     model = nn.Sequential(model, DeepStreamOutput())
